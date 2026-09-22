@@ -15,23 +15,12 @@ SKEL_H    := $(BPF_DIR)/scope.skel.h
 USER_SRC  := src/scope.c
 BIN       := scope
 
-# uname -m -> __TARGET_ARCH_* mapping for the BPF compile.
+# x86_64 only, by decision. No multi-arch mapping.
 UNAME_M := $(shell uname -m)
-ifeq ($(UNAME_M),x86_64)
-  BPF_ARCH := x86
-else ifeq ($(UNAME_M),aarch64)
-  BPF_ARCH := arm64
-else ifeq ($(UNAME_M),armv7l)
-  BPF_ARCH := arm
-else ifeq ($(UNAME_M),riscv64)
-  BPF_ARCH := riscv
-else ifeq ($(UNAME_M),ppc64le)
-  BPF_ARCH := powerpc
-else ifeq ($(UNAME_M),s390x)
-  BPF_ARCH := s390
-else
-  $(error unsupported arch for BPF build: $(UNAME_M))
+ifneq ($(UNAME_M),x86_64)
+  $(error scope supports x86_64 only (got $(UNAME_M)))
 endif
+BPF_ARCH := x86
 
 BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_$(BPF_ARCH) \
 	      -I$(BPF_DIR) -Wall -Wno-missing-declarations

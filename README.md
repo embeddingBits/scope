@@ -18,7 +18,9 @@ CONFIG_BPF_SYSCALL=y
 CONFIG_DEBUG_INFO_BTF=y        # exposes /sys/kernel/btf/vmlinux
 ```
 
-Ring buffer support needs kernel >= 5.8. Developed/tested on 6.x/7.x.
+Ring buffer support needs kernel >= 5.8, and that is the floor: no
+perf-buffer fallback for older kernels, by decision. Developed/tested
+on 6.x/7.x, x86_64 only.
 
 Packages — Arch/CachyOS:
 
@@ -148,11 +150,12 @@ New kinds are appended in later phases; old values never change meaning.
 - `-p` matches the exec'ing task **or its parent**, so `scope -p SHELL`
   shows what that shell launches (fork+exec children have their own
   pid). Later-phase programs filter on current pid only.
-- Dynamic libbpf link (`-lbpf`): no static archive ships on most
-  distros; static linking would require building libbpf from source.
-  Documented alternative: `pacman -S libbpf` / `apt install libbpf1`.
-- Tested on x86_64; other arches fall out of the Makefile's
-  `__TARGET_ARCH_*` mapping but are untested.
+- Dynamic libbpf link (`-lbpf`) for now. Static linking is the goal
+  (Phase 7): it needs libbpf and zlib built from source, since only
+  `libelf.a` ships on this host (`libbpf.a`/`libz.a` absent).
+  Documented alternative until then: `pacman -S libbpf` / `apt install libbpf1`.
+- x86_64 only, by decision — single-arch keeps BPF CFLAGS, the syscall
+  table, and struct assumptions simple.
 
 ## Roadmap
 
@@ -163,8 +166,7 @@ New kinds are appended in later phases; old values never change meaning.
 - **Phase 4** — TCP: connect/close/accept hooks, 5-tuple via CO-RE,
   connection table with lifecycle.
 - **Phase 5** — aggregation layer + filtering across all sources.
-- **Phase 6** — ncurses multi-panel TUI (decision: ncurses vs minimal
-  ANSI renderer to be stated).
+- **Phase 6** — ncurses multi-panel TUI (renderer decided: ncurses).
 - **Phase 7** — CLI polish, JSON mode parity, README final pass.
 
 ## License
