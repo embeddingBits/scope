@@ -60,8 +60,7 @@ $(SYSNAMES_H): $(SYSCALL_HDR)
 	@echo "== gen $@ =="
 	@{ \
 		printf '/* SPDX-License-Identifier: GPL-2.0 */\n'; \
-		printf '/* Generated from %s - x86_64 syscall table (stable ABI). */\n' \
-			'$(SYSCALL_HDR)'; \
+		printf '/* Generated from asm/unistd_64.h - x86_64 syscall table (stable ABI). */\n'; \
 		printf 'static const char *const syscall_names[] = {\n'; \
 		awk '/^#define __NR_/ { printf "\t[%d] = \"%s\",\n", $$3, substr($$2, 6) }' \
 			'$(SYSCALL_HDR)'; \

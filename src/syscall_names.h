@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Generated from /usr/include/asm/unistd_64.h - x86_64 syscall table (stable ABI). */
+/* Generated from asm/unistd_64.h - x86_64 syscall table (stable ABI). */
 static const char *const syscall_names[] = {
 	[0] = "read",
 	[1] = "write",

@@ -179,7 +179,13 @@ New kinds are appended in later phases; old values never change meaning.
 - Syscall percentiles are bucket upper bounds from the log2 histogram
   (slot s = [2^(s-1), 2^s) ns; slot 31 saturates), not exact values.
 - Syscall histogram is cumulative since start; interval deltas are
-  computed in userspace by diffing snapshots.
+  computed in userspace by diffing snapshots. The dump sorts by count
+  (latency columns ride along); a latency-sorted view arrives with the
+  TUI.
+- Deviation: the brief said "per-CPU array" for histograms; the map is
+  `PERCPU_HASH` instead — sparse over 512 possible syscall nrs, bounded
+  at 512 keys, whereas a flat array would idle at ~140 KB/CPU. Trade:
+  one hash lookup per syscall exit instead of O(1) indexing.
 - Dynamic libbpf link (`-lbpf`) for now. Static linking is the goal
   (Phase 7): it needs libbpf and zlib built from source, since only
   `libelf.a` ships on this host (`libbpf.a`/`libz.a` absent).

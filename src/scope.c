@@ -245,14 +245,12 @@ static __u64 percentile_ns(const __u64 *slots, __u64 count, double p)
 	return slot_upper_ns(SCOPE_HIST_SLOTS - 1);
 }
 
-/* One aggregated syscall row. `d_*` are interval deltas; percentiles are
- * computed on the delta histogram. */
+/* One aggregated syscall row. `delta` is the interval diff of the
+ * in-kernel histogram; percentiles are computed on it. */
 struct sys_row {
 	__u32 nr;
 	const char *name;
-	__u64 d_count;
-	__u64 d_total_ns;
-	__u64 d_slots[SCOPE_HIST_SLOTS];
+	struct sys_hist delta;
 	__u64 avg_ns, p50_ns, p90_ns, p99_ns;
 };
 
@@ -261,19 +259,24 @@ static int row_cmp(const void *a, const void *b)
 	const struct sys_row *ra = *(struct sys_row *const *)a;
 	const struct sys_row *rb = *(struct sys_row *const *)b;
 
-	if (ra->d_count < rb->d_count)
+	if (ra->delta.count < rb->delta.count)
 		return 1;
-	if (ra->d_count > rb->d_count)
+	if (ra->delta.count > rb->delta.count)
 		return -1;
 	return 0;
 }
 
-/* Sum one PERCPU_HASH value across CPUs (libbpf lays percpu values out
- * with stride roundup(value_size, 8)). */
+/* libbpf lays percpu map values out with stride roundup(value_size, 8). */
+static size_t percpu_stride(size_t vsize)
+{
+	return (vsize + 7) & ~7UL;
+}
+
+/* Sum one PERCPU_HASH value across CPUs. */
 static void sum_percpu(const void *vals, int ncpus, size_t vsize,
 		       struct sys_hist *out)
 {
-	size_t stride = (vsize + 7) & ~7UL;
+	size_t stride = percpu_stride(vsize);
 
 	memset(out, 0, sizeof(*out));
 	for (int cpu = 0; cpu < ncpus; cpu++) {
@@ -299,7 +302,7 @@ static void dump_syscalls(struct scope_bpf *skel, bool json,
 	int map_fd = bpf_map__fd(skel->maps.sys_hist);
 	int ncpus = libbpf_num_possible_cpus();
 	size_t vsize = bpf_map__value_size(skel->maps.sys_hist);
-	size_t pbuf_sz = ((vsize + 7) & ~7UL) * ncpus;
+	size_t pbuf_sz = percpu_stride(vsize) * ncpus;
 	char *pbuf = malloc(pbuf_sz);
 	__u64 grand_count = 0, grand_total = 0;
 	double dt;
@@ -327,17 +330,21 @@ static void dump_syscalls(struct scope_bpf *skel, bool json,
 			struct sys_row *r = &rows[n++];
 			r->nr = key;
 			r->name = syscall_name(key);
-			r->d_count = cur.count - (p ? p->count : 0);
-			r->d_total_ns = cur.total_ns - (p ? p->total_ns : 0);
+			r->delta.count = cur.count - (p ? p->count : 0);
+			r->delta.total_ns = cur.total_ns - (p ? p->total_ns : 0);
 			for (int s = 0; s < SCOPE_HIST_SLOTS; s++)
-				r->d_slots[s] = cur.slots[s] - (p ? p->slots[s] : 0);
-			r->avg_ns = r->d_count ?
-				r->d_total_ns / r->d_count : 0;
-			r->p50_ns = percentile_ns(r->d_slots, r->d_count, 0.50);
-			r->p90_ns = percentile_ns(r->d_slots, r->d_count, 0.90);
-			r->p99_ns = percentile_ns(r->d_slots, r->d_count, 0.99);
-			grand_count += r->d_count;
-			grand_total += r->d_total_ns;
+				r->delta.slots[s] =
+					cur.slots[s] - (p ? p->slots[s] : 0);
+			r->avg_ns = r->delta.count ?
+				r->delta.total_ns / r->delta.count : 0;
+			r->p50_ns = percentile_ns(r->delta.slots,
+						  r->delta.count, 0.50);
+			r->p90_ns = percentile_ns(r->delta.slots,
+						  r->delta.count, 0.90);
+			r->p99_ns = percentile_ns(r->delta.slots,
+						  r->delta.count, 0.99);
+			grand_count += r->delta.count;
+			grand_total += r->delta.total_ns;
 		}
 		prev[key] = cur;
 	}
@@ -368,7 +375,7 @@ static void dump_syscalls(struct scope_bpf *skel, bool json,
 			       "\"avg_ns\":%llu,\"p50_ns\":%llu,"
 			       "\"p90_ns\":%llu,\"p99_ns\":%llu}",
 			       r->nr, r->name,
-			       (unsigned long long)r->d_count,
+			       (unsigned long long)r->delta.count,
 			       (unsigned long long)r->avg_ns,
 			       (unsigned long long)r->p50_ns,
 			       (unsigned long long)r->p90_ns,
@@ -393,8 +400,8 @@ static void dump_syscalls(struct scope_bpf *skel, bool json,
 			fmt_ns(p90, sizeof(p90), r->p90_ns);
 			fmt_ns(p99, sizeof(p99), r->p99_ns);
 			printf("  %-18s %10llu %8llu %9s %9s %9s %9s\n",
-			       r->name, (unsigned long long)r->d_count,
-			       (unsigned long long)(r->d_count / dt),
+			       r->name, (unsigned long long)r->delta.count,
+			       (unsigned long long)(r->delta.count / dt),
 			       avg, p50, p90, p99);
 		}
 	}
