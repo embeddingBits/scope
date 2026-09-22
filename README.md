@@ -3,11 +3,13 @@
 Low-overhead, production-minded observability for Linux: pure C + libbpf
 with CO-RE (Compile Once – Run Everywhere). No bcc, no Python.
 
-> **Status: Phases 1–2 complete** — process exec tracing
-> (`sched_process_exec` → ringbuf → human/JSON) and syscall latency
-> (raw_syscalls enter/exit → per-thread start map → in-kernel log2
-> histogram → 1 s top-syscalls dump with p50/p90/p99). Phases 3–7
-> (file I/O, TCP, aggregation, TUI, polish) are roadmap items below.
+> **Status: Phases 1–3 complete** — process exec tracing
+> (`sched_process_exec` → ringbuf), syscall latency (raw_syscalls
+> enter/exit → log2 histogram → 1 s top-N dump with p50/p90/p99), and
+> file I/O (read/write/pread64/pwrite64 at the raw-syscall layer +
+> vfs_read/vfs_write refinement, filename + dirname, bytes, latency,
+> `-l` threshold). Phases 4–7 (TCP, aggregation, TUI, polish) are
+> roadmap items below.
 
 ## Prerequisites
 
@@ -80,24 +82,30 @@ Output fields per exec: timestamp, pid, ppid, uid, gid, cgroup id,
 comm, filename. Once per second, a top-syscalls table is appended:
 interval event count/rate and, per syscall, count, rate, avg and
 p50/p90/p99 latency from the in-kernel log2 histogram (JSON mode emits
-`{"type":"syscalls", ...}` records instead). `-l` is parsed and stored
-in the kernel config map now; it takes effect in the I/O phase.
+`{"type":"syscalls", ...}` records instead). File I/O events stream as
+`IO READ/WRITE pid=.. tid=.. comm=.. bytes=.. lat file=dir/name`
+(`{"type":"io", ...}` in JSON). `-l N` drops I/O events faster than
+N microseconds.
 
 ## Architecture
 
 ```text
                   ┌─ tracepoint/sched/sched_process_exec
-                  │─ tracepoint/raw_syscalls/sys_enter (sampling gate + filters)
-  kernel          │─ tracepoint/raw_syscalls/sys_exit (start map → log2 hist)
-                  │   1. config-map check (pid/cgroup/sample) → early return
-                  │   2. ringbuf_reserve (drop on pressure, never block)
-                  │   3. fill exec_event, ringbuf_submit
+                  │─ tracepoint/raw_syscalls/sys_enter ─ sampling gate,
+  kernel          │   filters, sys_start[ts], io_start[fd] (I/O syscalls)
+                  │─ tracepoint/raw_syscalls/sys_exit ─ sys_hist log2
+                  │   buckets + I/O emit (reads on 7.x, fallback path)
+                  │─ kprobe/kretprobe vfs_read/vfs_write ─ overwrite
+                  │   io_start with direct file* (<= 6.x refinement)
                   ▼
   ringbuf  ┌──────────────┐  single 256 KiB BPF_MAP_TYPE_RINGBUF
-  (events) │ sched exec   │  (ordering + low userspace overhead)
+  (events) │ exec + io    │  (ordering + low userspace overhead)
            └──────────────┘
            ┌──────────────┐  LRU_HASH sys_start[tid] = enter ts (no leak
            │ sys_start    │  on thread death mid-syscall)
+           └──────────────┘
+           ┌──────────────┐  LRU_HASH io_start[tid] = {ts, fd|file*}
+           │ io_start     │  (two-layer dedup: one event per op)
            └──────────────┘
            ┌──────────────┐  PERCPU_HASH sys_hist[nr] = log2 latency slots
            │ sys_hist     │  (in-kernel aggregation, zero per-event traffic)
@@ -111,7 +119,7 @@ in the kernel config map now; it takes effect in the I/O phase.
              │ Phase 6→  │── ui.c: ncurses multi-panel dashboard
              └───────────┘
   config     ┌───────────┐
-  (down)     │ scope_cfg │── ARRAY[1]: sample_rate, target_pid,
+  (down)     │ scope_cfg │── ARRAY[1]: sample_rate, target_pid, self_pid,
              │  map      │   target_cgroup_id, min_latency_ns
              └───────────┘
 ```
@@ -143,13 +151,27 @@ New kinds are appended in later phases; old values never change meaning.
   cross the ringbuf. Syscall latency uses in-kernel log2 buckets summed
   on read. Percpu updates are plain increments on the local CPU — no
   atomics, no cross-CPU cacheline traffic; userspace does one bounded
-  key iteration per second.
+  key iteration per second. (Deviation: the brief said "per-CPU array";
+  the map is `PERCPU_HASH` — sparse over 512 possible nrs, bounded at
+  512 keys, vs ~140 KB/CPU idle for a flat array. Trade: one hash
+  lookup per syscall exit instead of O(1) indexing.)
 - **Sampling gate on enter only.** Syscall enter/exit never disagree on
   the sampling decision: the gate lives solely in `sys_enter`, and
   `sys_exit` is driven by the presence of a start entry — no torn
   samples, no start-map leaks from skipped exits.
-- **LRU start map.** A thread dying inside a syscall can't leak
-  `sys_start` entries or evict live ones (LRU_HASH, 10k entries).
+- **Two-layer I/O with one event per op.** The I/O start slot is written
+  at the raw-syscall layer (fd captured from `args[0]`, an ABI stable on
+  every kernel) and overwritten by the vfs layer where it exists
+  (<= 6.x). Whichever exit fires first consumes the slot; the other
+  exits silently. No double counting, no per-op overhead beyond two map
+  updates on old kernels and one on new ones.
+- **Self-exclusion.** `self_pid` in the config map keeps scope from
+  tracing its own event output — without it every emitted event is
+  itself a write syscall and the pipeline feeds back on itself (in
+  practice: gigabytes of events in seconds).
+- **LRU start maps.** A thread dying inside a syscall can't leak
+  `sys_start`/`io_start` entries or evict live ones (LRU_HASH, 10k
+  entries each).
 - **No busy polling.** Userspace sleeps in `ring_buffer__poll` (epoll)
   with a 20 ms timeout — responsive shutdown, ~0 CPU when idle. The 1 s
   histogram dump rides the same loop (no timer thread).
@@ -168,24 +190,55 @@ New kinds are appended in later phases; old values never change meaning.
 3. `__data_loc` filename is resolved manually (`(void *)ctx + (off &
    0xffff)`), exact per the trace ABI, instead of assuming pointer
    semantics.
+4. **`struct io_event` collides with the kernel's aio `struct io_event`**
+   in vmlinux.h (both headers land in the same TU). Renamed to
+   `struct scope_io_event`.
+5. **Self-tracing feedback loop.** The first I/O build traced its own
+   stdout writes: every emitted event triggered another event, filling
+   tmpfs with gigabytes in seconds. Fixed with a `self_pid` config field
+   checked in the enter gate — and the syscall histogram gate too, so
+   scope's own syscalls never pollute its numbers.
 
-## Known limitations (Phases 1–2)
+## Kernel-7.x findings (why the I/O attach points look like they do)
 
-- Exec + syscalls only: no exit events, argv (filename only), no
-  I/O/TCP yet.
+The spec's attach points were `vfs_read`/`vfs_write` kprobes. Two things
+discovered on the 7.2.2 test kernel forced a deviation (verified via
+ftrace function_graph, not assumed):
+
+- **7.x reads bypass `vfs_read`.** `__x64_sys_pread64` dispatches
+  straight to `f_op->read_iter` (e.g. `shmem_file_read_iter`); `vfs_read`
+  is never entered from the read syscalls. `vfs_write` still fires
+  (via pwrite64), but relying on vfs probes alone silently loses all
+  reads.
+- **7.x `__x64_sys_*` takes `struct pt_regs *`.** BTF on 7.2.2 shows
+  `FUNC_PROTO '__x64_sys_pread64'` with a single `regs` parameter —
+  the expanded-argument signature that kprobes relied on is gone, so
+  arg0-based reads of `fd` silently yield the regs pointer.
+
+Resolution: the syscall layer now uses the `raw_syscalls` tracepoints'
+`args[0]` (stable tracepoint ABI on every kernel), and the
+vfs_read/vfs_write kprobes remain as a refinement layer that overwrites
+the per-thread slot where they still fire. The dedup scheme guarantees
+exactly one event per I/O op on any kernel.
+
+## Known limitations (Phases 1–3)
+
+- Exec + syscalls + file I/O only: no exit events, argv (filename
+  only), no TCP yet.
 - `-p` matches the exec'ing task **or its parent** (fork+exec children
-  have their own pid); syscall programs match tid **or** tgid (all
+  have their own pid); syscall/I/O programs match tid **or** tgid (all
   threads of the process).
+- Filenames are dentry name + one-hop parent dir only; no full path in
+  the kernel (full-path work is userspace, planned with aggregation).
+- Reads/writes are traced at syscall level (fd resolution via
+  current->files); an fd closed by another thread mid-op yields an
+  empty name (graceful, bounded).
 - Syscall percentiles are bucket upper bounds from the log2 histogram
   (slot s = [2^(s-1), 2^s) ns; slot 31 saturates), not exact values.
 - Syscall histogram is cumulative since start; interval deltas are
   computed in userspace by diffing snapshots. The dump sorts by count
   (latency columns ride along); a latency-sorted view arrives with the
   TUI.
-- Deviation: the brief said "per-CPU array" for histograms; the map is
-  `PERCPU_HASH` instead — sparse over 512 possible syscall nrs, bounded
-  at 512 keys, whereas a flat array would idle at ~140 KB/CPU. Trade:
-  one hash lookup per syscall exit instead of O(1) indexing.
 - Dynamic libbpf link (`-lbpf`) for now. Static linking is the goal
   (Phase 7): it needs libbpf and zlib built from source, since only
   `libelf.a` ships on this host (`libbpf.a`/`libz.a` absent).
@@ -195,8 +248,6 @@ New kinds are appended in later phases; old values never change meaning.
 
 ## Roadmap
 
-- **Phase 3** — file I/O: vfs_read/vfs_write kprobes, filename via
-  dentry, size/latency events with sampling + threshold.
 - **Phase 4** — TCP: connect/close/accept hooks, 5-tuple via CO-RE,
   connection table with lifecycle.
 - **Phase 5** — aggregation layer + filtering across all sources.

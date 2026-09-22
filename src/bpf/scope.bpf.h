@@ -38,8 +38,10 @@ enum scope_event_type {
 struct scope_config {
 	__u32 sample_rate;	/* 1 = every event, N = emit ~1-in-N */
 	__u32 target_pid;	/* 0 = all PIDs */
+	__u32 self_pid;		/* scope's own pid: never traced (feedback) */
+	__u32 _pad;
 	__u64 target_cgroup_id;	/* 0 = all cgroups */
-	__u64 min_latency_ns;	/* reserved: I/O + syscall phases */
+	__u64 min_latency_ns;	/* I/O latency threshold (-l) */
 };
 
 /* SCOPE_EVENT_EXEC payload: one successful exec(). */
@@ -54,12 +56,41 @@ struct exec_event {
 	char filename[SCOPE_FILENAME_LEN];
 };
 
+/* File I/O direction (Phase 3). */
+enum scope_io_kind {
+	SCOPE_IO_READ = 1,
+	SCOPE_IO_WRITE = 2,
+};
+
+/* SCOPE_EVENT_IO payload: one completed vfs_read/vfs_write.
+ * Named scope_io_event: vmlinux.h already defines `struct io_event`
+ * (aio), and the BPF TU includes both headers. */
+struct scope_io_event {
+	__u64 timestamp_ns;	/* bpf_ktime_get_ns() at exit */
+	__u64 delta_ns;		/* entry -> exit */
+	__u32 pid;
+	__u32 tid;
+	__u32 kind;		/* enum scope_io_kind */
+	__u32 fd;		/* fd the op went through (path work aid) */
+	__s64 bytes;		/* positive: bytes moved (syscall return) */
+	char comm[SCOPE_COMM_LEN];
+	char filename[SCOPE_FILENAME_LEN];
+	char dirname[SCOPE_FILENAME_LEN]; /* d_parent name, one hop only */
+};
+
 /* Syscall latency histogram (Phase 2). One entry per syscall nr in a
  * PERCPU_HASH: pure in-kernel aggregation, zero per-event traffic.
  * Slot s holds samples in [2^(s-1), 2^s) ns; slot 0 holds exact-zero;
  * slot 31 saturates (holds everything >= 2^30 ns). */
 #define SCOPE_HIST_SLOTS 32
 #define SCOPE_MAX_SYSCALL_NR 512
+
+/* x86_64 syscall numbers (stable ABI) for the I/O syscalls we trace at
+ * the raw-syscall layer. vmlinux.h does not define __NR_*. */
+#define SCOPE_NR_read      0
+#define SCOPE_NR_write     1
+#define SCOPE_NR_pread64   17
+#define SCOPE_NR_pwrite64  18
 
 struct sys_hist {
 	__u64 slots[SCOPE_HIST_SLOTS];
@@ -73,6 +104,7 @@ struct scope_event {
 	__u32 _pad;
 	union {
 		struct exec_event exec;
+		struct scope_io_event io;
 	} data;
 };
 

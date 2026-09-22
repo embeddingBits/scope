@@ -153,6 +153,59 @@ static void print_human(const struct exec_event *e)
 	       (unsigned long long)e->cgroup_id);
 }
 
+static void fmt_ns(char *out, size_t n, __u64 ns)
+{
+	if (ns >= 1000000000ULL)
+		snprintf(out, n, "%.2fs", (double)ns / 1e9);
+	else if (ns >= 1000000ULL)
+		snprintf(out, n, "%.2fms", (double)ns / 1e6);
+	else if (ns >= 1000ULL)
+		snprintf(out, n, "%.2fus", (double)ns / 1e3);
+	else
+		snprintf(out, n, "%lluns", (unsigned long long)ns);
+}
+
+static const char *io_kind_str(__u32 kind)
+{
+	return kind == SCOPE_IO_READ ? "READ" : "WRITE";
+}
+
+static const char *io_kind_json(__u32 kind)
+{
+	return kind == SCOPE_IO_READ ? "read" : "write";
+}
+
+static void print_io_human(const struct scope_io_event *e)
+{
+	char ts[32], lat[32];
+	time_t sec = (time_t)(e->timestamp_ns / 1000000000ULL);
+	struct tm tm;
+
+	localtime_r(&sec, &tm);
+	strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
+	fmt_ns(lat, sizeof(lat), e->delta_ns);
+	printf("%s.%03llu IO  %-5s pid=%-7u tid=%-7u comm=%.16s bytes=%-11lld %s file=%s/%s\n",
+	       ts, (e->timestamp_ns / 1000000ULL) % 1000ULL,
+	       io_kind_str(e->kind), e->pid, e->tid, e->comm,
+	       (long long)e->bytes, lat, e->dirname, e->filename);
+}
+
+static void print_io_json(const struct scope_io_event *e)
+{
+	printf("{\"type\":\"io\",\"ts\":%llu,\"pid\":%u,\"tid\":%u,"
+	       "\"op\":\"%s\",\"fd\":%u,\"bytes\":%lld,\"latency_ns\":%llu,"
+	       "\"comm\":",
+	       (unsigned long long)e->timestamp_ns, e->pid, e->tid,
+	       io_kind_json(e->kind), e->fd, (long long)e->bytes,
+	       (unsigned long long)e->delta_ns);
+	json_escape(stdout, e->comm, sizeof(e->comm));
+	printf(",\"file\":");
+	json_escape(stdout, e->filename, sizeof(e->filename));
+	printf(",\"dir\":");
+	json_escape(stdout, e->dirname, sizeof(e->dirname));
+	printf("}\n");
+}
+
 static void print_json(const struct exec_event *e)
 {
 	printf("{\"type\":\"exec\",\"ts\":%llu,\"pid\":%u,\"ppid\":%u,"
@@ -175,14 +228,23 @@ static int handle_event(void *ctx, void *data, size_t len)
 		fprintf(stderr, "truncated event (%zu bytes), dropped\n", len);
 		return 0;
 	}
-	if (ev->type != SCOPE_EVENT_EXEC) {
+	switch (ev->type) {
+	case SCOPE_EVENT_EXEC:
+		if (opt.json)
+			print_json(&ev->data.exec);
+		else
+			print_human(&ev->data.exec);
+		break;
+	case SCOPE_EVENT_IO:
+		if (opt.json)
+			print_io_json(&ev->data.io);
+		else
+			print_io_human(&ev->data.io);
+		break;
+	default:
 		fprintf(stderr, "unknown event type %u, dropped\n", ev->type);
 		return 0;
 	}
-	if (opt.json)
-		print_json(&ev->data.exec);
-	else
-		print_human(&ev->data.exec);
 	fflush(stdout);
 	return 0;
 }
@@ -204,18 +266,6 @@ static const char *syscall_name(__u32 nr)
 	char *b = buf[idx++ % 4];
 	snprintf(b, 16, "sys_%u", nr);
 	return b;
-}
-
-static void fmt_ns(char *out, size_t n, __u64 ns)
-{
-	if (ns >= 1000000000ULL)
-		snprintf(out, n, "%.2fs", (double)ns / 1e9);
-	else if (ns >= 1000000ULL)
-		snprintf(out, n, "%.2fms", (double)ns / 1e6);
-	else if (ns >= 1000ULL)
-		snprintf(out, n, "%.2fus", (double)ns / 1e3);
-	else
-		snprintf(out, n, "%lluns", (unsigned long long)ns);
 }
 
 /* Upper bound of histogram slot s in ns: slot s covers [2^(s-1), 2^s).
@@ -452,6 +502,7 @@ int main(int argc, char **argv)
 	/* Push config into the kernel before attaching. */
 	cfg.sample_rate = opt.sample_rate;
 	cfg.target_pid = opt.pid;
+	cfg.self_pid = (__u32)getpid();
 	cfg.target_cgroup_id = opt.cgroup_id;
 	cfg.min_latency_ns = opt.min_latency_ns;
 	if (bpf_map__update_elem(skel->maps.scope_cfg, &zero, sizeof(zero),
@@ -484,8 +535,8 @@ int main(int argc, char **argv)
 
 	if (!opt.json) {
 		fprintf(stderr,
-			"scope: tracing exec + syscalls (pid=%u sample=1-in-%u). "
-			"Ctrl-C to stop.\n",
+			"scope: tracing exec + syscalls + file I/O "
+			"(pid=%u sample=1-in-%u). Ctrl-C to stop.\n",
 			opt.pid, opt.sample_rate);
 	}
 
