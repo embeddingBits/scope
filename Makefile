@@ -13,6 +13,8 @@ BPF_OBJ   := $(BPF_DIR)/scope.bpf.o
 VMLINUX_H := $(BPF_DIR)/vmlinux.h
 SKEL_H    := $(BPF_DIR)/scope.skel.h
 USER_SRC  := src/scope.c
+SYSNAMES_H := src/syscall_names.h
+SYSCALL_HDR := /usr/include/asm/unistd_64.h
 BIN       := scope
 
 # x86_64 only, by decision. No multi-arch mapping.
@@ -38,6 +40,8 @@ deps:
 		|| { echo "MISSING: libbpf headers (install libbpf-dev / libbpf)"; exit 1; }
 	@test -f /sys/kernel/btf/vmlinux \
 		|| { echo "MISSING: /sys/kernel/btf/vmlinux (need CONFIG_DEBUG_INFO_BTF)"; exit 1; }
+	@test -f $(SYSCALL_HDR) \
+		|| { echo "MISSING: $(SYSCALL_HDR) (install linux-api-headers)"; exit 1; }
 	@echo "clang:    $$(clang --version | head -1)"
 	@echo "bpftool:  $$(bpftool version | head -1)"
 	@echo "libbpf:   headers present"
@@ -50,6 +54,20 @@ $(VMLINUX_H):
 
 vmlinux: $(VMLINUX_H)
 
+# x86_64 syscall table is stable kernel ABI (never renumbered); generate the
+# name table from the installed kernel-api headers rather than hand-editing.
+$(SYSNAMES_H): $(SYSCALL_HDR)
+	@echo "== gen $@ =="
+	@{ \
+		printf '/* SPDX-License-Identifier: GPL-2.0 */\n'; \
+		printf '/* Generated from %s - x86_64 syscall table (stable ABI). */\n' \
+			'$(SYSCALL_HDR)'; \
+		printf 'static const char *const syscall_names[] = {\n'; \
+		awk '/^#define __NR_/ { printf "\t[%d] = \"%s\",\n", $$3, substr($$2, 6) }' \
+			'$(SYSCALL_HDR)'; \
+		printf '};\n'; \
+	} > $@
+
 $(BPF_OBJ): $(BPF_SRC) $(BPF_HDR) $(VMLINUX_H)
 	@echo "== clang $@ =="
 	clang $(BPF_CFLAGS) -c $(BPF_SRC) -o $@
@@ -58,9 +76,9 @@ $(SKEL_H): $(BPF_OBJ)
 	@echo "== bpftool gen skeleton $@ =="
 	bpftool gen skeleton $(BPF_OBJ) > $@
 
-$(BIN): $(USER_SRC) $(SKEL_H) $(BPF_HDR)
+$(BIN): $(USER_SRC) $(SKEL_H) $(BPF_HDR) $(SYSNAMES_H)
 	@echo "== gcc $@ =="
 	gcc -g -O2 -Wall -Wextra -Isrc -o $(BIN) $(USER_SRC) -lbpf -lelf -lz
 
 clean:
-	rm -f $(BPF_OBJ) $(SKEL_H) $(VMLINUX_H) $(BIN)
+	rm -f $(BPF_OBJ) $(SKEL_H) $(VMLINUX_H) $(SYSNAMES_H) $(BIN)

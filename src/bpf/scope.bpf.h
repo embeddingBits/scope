@@ -54,6 +54,19 @@ struct exec_event {
 	char filename[SCOPE_FILENAME_LEN];
 };
 
+/* Syscall latency histogram (Phase 2). One entry per syscall nr in a
+ * PERCPU_HASH: pure in-kernel aggregation, zero per-event traffic.
+ * Slot s holds samples in [2^(s-1), 2^s) ns; slot 0 holds exact-zero;
+ * slot 31 saturates (holds everything >= 2^30 ns). */
+#define SCOPE_HIST_SLOTS 32
+#define SCOPE_MAX_SYSCALL_NR 512
+
+struct sys_hist {
+	__u64 slots[SCOPE_HIST_SLOTS];
+	__u64 count;
+	__u64 total_ns;
+};
+
 /* Ringbuf envelope. Union grows in later phases. */
 struct scope_event {
 	__u32 type;		/* enum scope_event_type */

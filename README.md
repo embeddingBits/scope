@@ -3,10 +3,11 @@
 Low-overhead, production-minded observability for Linux: pure C + libbpf
 with CO-RE (Compile Once – Run Everywhere). No bcc, no Python.
 
-> **Status: Phase 1 complete** — process exec tracing
-> (`sched_process_exec` → ringbuf → human/JSON output). Phases 2–7
-> (syscalls, file I/O, TCP, aggregation, TUI, polish) are roadmap items
-> below; the event ABI and config map are already shaped for them.
+> **Status: Phases 1–2 complete** — process exec tracing
+> (`sched_process_exec` → ringbuf → human/JSON) and syscall latency
+> (raw_syscalls enter/exit → per-thread start map → in-kernel log2
+> histogram → 1 s top-syscalls dump with p50/p90/p99). Phases 3–7
+> (file I/O, TCP, aggregation, TUI, polish) are roadmap items below.
 
 ## Prerequisites
 
@@ -53,7 +54,9 @@ What `make build` does, in order:
    (`__TARGET_ARCH_*` is picked from `uname -m`).
 3. `bpftool gen skeleton scope.bpf.o` → `scope.skel.h` (typed
    open/load/attach API — no hand-rolled loading).
-4. `gcc src/scope.c -lbpf -lelf -lz` → `./scope` (dynamic libbpf link;
+4. awk over `/usr/include/asm/unistd_64.h` → `src/syscall_names.h`
+   (x86_64 syscall table is stable ABI; generated, never hand-edited).
+5. `gcc src/scope.c -lbpf -lelf -lz` → `./scope` (dynamic libbpf link;
    see note below).
 
 ## Usage
@@ -74,21 +77,33 @@ sudo ./scope -v                           # verbose libbpf log (loader/verifier 
 ```
 
 Output fields per exec: timestamp, pid, ppid, uid, gid, cgroup id,
-comm, filename. `-l` is parsed and stored in the kernel config map now;
-it takes effect in the I/O + syscall phases.
+comm, filename. Once per second, a top-syscalls table is appended:
+interval event count/rate and, per syscall, count, rate, avg and
+p50/p90/p99 latency from the in-kernel log2 histogram (JSON mode emits
+`{"type":"syscalls", ...}` records instead). `-l` is parsed and stored
+in the kernel config map now; it takes effect in the I/O phase.
 
 ## Architecture
 
 ```text
                   ┌─ tracepoint/sched/sched_process_exec
-  kernel          │   1. config-map check (pid/cgroup/sample) → early return
+                  │─ tracepoint/raw_syscalls/sys_enter (sampling gate + filters)
+  kernel          │─ tracepoint/raw_syscalls/sys_exit (start map → log2 hist)
+                  │   1. config-map check (pid/cgroup/sample) → early return
                   │   2. ringbuf_reserve (drop on pressure, never block)
                   │   3. fill exec_event, ringbuf_submit
                   ▼
   ringbuf  ┌──────────────┐  single 256 KiB BPF_MAP_TYPE_RINGBUF
   (events) │ sched exec   │  (ordering + low userspace overhead)
            └──────────────┘
+           ┌──────────────┐  LRU_HASH sys_start[tid] = enter ts (no leak
+           │ sys_start    │  on thread death mid-syscall)
+           └──────────────┘
+           ┌──────────────┐  PERCPU_HASH sys_hist[nr] = log2 latency slots
+           │ sys_hist     │  (in-kernel aggregation, zero per-event traffic)
+           └──────────────┘
                   │  ring_buffer__poll, 20 ms timeout (epoll, no busy-loop)
+                  │  + 1 s tick: sum percpu hist → top-10 table (p50/90/99)
                   ▼
   userspace  ┌───────────┐
   ./scope    │ scope.c   │── human lines (default) or JSON lines (-o json)
@@ -122,12 +137,22 @@ New kinds are appended in later phases; old values never change meaning.
   per-CPU perf buffers; `ringbuf_reserve` fails gracefully rather than
   stalling the traced task. Lost events are a backpressure signal, not a
   correctness bug, for a sampling observer.
-- **Aggregate in-kernel (Phases 2+).** Pure counters/histograms live in
-  `PERCPU` maps (no per-event traffic at all); only events needing
-  per-event detail (exec, TCP lifecycle, over-threshold I/O) cross the
-  ringbuf. Syscall latency uses in-kernel log2 buckets summed on read.
+- **Aggregate in-kernel (Phase 2, live).** Pure counters/histograms
+  live in `PERCPU` maps (no per-event traffic at all); only events
+  needing per-event detail (exec, TCP lifecycle, over-threshold I/O)
+  cross the ringbuf. Syscall latency uses in-kernel log2 buckets summed
+  on read. Percpu updates are plain increments on the local CPU — no
+  atomics, no cross-CPU cacheline traffic; userspace does one bounded
+  key iteration per second.
+- **Sampling gate on enter only.** Syscall enter/exit never disagree on
+  the sampling decision: the gate lives solely in `sys_enter`, and
+  `sys_exit` is driven by the presence of a start entry — no torn
+  samples, no start-map leaks from skipped exits.
+- **LRU start map.** A thread dying inside a syscall can't leak
+  `sys_start` entries or evict live ones (LRU_HASH, 10k entries).
 - **No busy polling.** Userspace sleeps in `ring_buffer__poll` (epoll)
-  with a 20 ms timeout — responsive shutdown, ~0 CPU when idle.
+  with a 20 ms timeout — responsive shutdown, ~0 CPU when idle. The 1 s
+  histogram dump rides the same loop (no timer thread).
 
 ## Verifier notes (issues hit, how resolved)
 
@@ -144,12 +169,17 @@ New kinds are appended in later phases; old values never change meaning.
    0xffff)`), exact per the trace ABI, instead of assuming pointer
    semantics.
 
-## Known limitations (Phase 1)
+## Known limitations (Phases 1–2)
 
-- Exec only: no exit events, argv (filename only), syscall/I/O/TCP yet.
-- `-p` matches the exec'ing task **or its parent**, so `scope -p SHELL`
-  shows what that shell launches (fork+exec children have their own
-  pid). Later-phase programs filter on current pid only.
+- Exec + syscalls only: no exit events, argv (filename only), no
+  I/O/TCP yet.
+- `-p` matches the exec'ing task **or its parent** (fork+exec children
+  have their own pid); syscall programs match tid **or** tgid (all
+  threads of the process).
+- Syscall percentiles are bucket upper bounds from the log2 histogram
+  (slot s = [2^(s-1), 2^s) ns; slot 31 saturates), not exact values.
+- Syscall histogram is cumulative since start; interval deltas are
+  computed in userspace by diffing snapshots.
 - Dynamic libbpf link (`-lbpf`) for now. Static linking is the goal
   (Phase 7): it needs libbpf and zlib built from source, since only
   `libelf.a` ships on this host (`libbpf.a`/`libz.a` absent).
@@ -159,8 +189,6 @@ New kinds are appended in later phases; old values never change meaning.
 
 ## Roadmap
 
-- **Phase 2** — syscall latency: raw_syscalls enter/exit, per-thread
-  start-time hash, in-kernel log2 histogram, top-syscalls dump.
 - **Phase 3** — file I/O: vfs_read/vfs_write kprobes, filename via
   dentry, size/latency events with sampling + threshold.
 - **Phase 4** — TCP: connect/close/accept hooks, 5-tuple via CO-RE,
