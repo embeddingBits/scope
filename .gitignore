@@ -1,0 +1,5 @@
+# generated — do not commit
+src/bpf/vmlinux.h
+src/bpf/*.o
+src/bpf/*.skel.h
+/scope
