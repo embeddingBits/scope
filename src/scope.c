@@ -33,6 +33,7 @@ static struct {
 	__u64 cgroup_id;
 	__u32 sample_rate;
 	__u64 min_latency_ns;
+	__u64 min_io_bytes;
 	bool json;
 	bool verbose;
 } opt = {
@@ -44,7 +45,9 @@ static struct argp_option options[] = {
 	{ "cgroup", 'c', "PATH", 0, "Trace only this cgroup (cgroupfs path)", 0 },
 	{ "sample", 's', "N", 0, "Sample 1-in-N events (default 1 = all)", 0 },
 	{ "min-latency", 'l', "USEC", 0,
-	  "Min latency to emit (reserved for I/O + syscall phases)", 0 },
+	  "Only emit I/O events >= this latency", 0 },
+	{ "min-bytes", 'b', "BYTES", 0,
+	  "Only emit I/O events >= this size", 0 },
 	{ "no-ui", 'n', 0, 0, "Stream JSON events, no TUI (same as -o json)", 0 },
 	{ "output", 'o', "MODE", 0, "'json' streams JSON lines to stdout", 0 },
 	{ "verbose", 'v', 0, 0, "Verbose libbpf output (shows loader/verifier log)", 0 },
@@ -68,6 +71,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 		break;
 	case 'l':
 		opt.min_latency_ns = strtoull(arg, NULL, 0) * 1000ULL;
+		break;
+	case 'b':
+		opt.min_io_bytes = strtoull(arg, NULL, 0);
 		break;
 	case 'n':
 		opt.json = true;
@@ -139,17 +145,26 @@ static void json_escape(FILE *f, const char *s, size_t max)
 	fputc('"', f);
 }
 
-static void print_human(const struct exec_event *e)
+/* "HH:MM:SS.mmm" wall-clock timestamp for human lines. */
+static void fmt_ts(char *out, size_t n, __u64 ts_ns)
 {
-	char ts[32];
-	time_t sec = (time_t)(e->timestamp_ns / 1000000000ULL);
+	time_t sec = (time_t)(ts_ns / 1000000000ULL);
 	struct tm tm;
 
 	localtime_r(&sec, &tm);
-	strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
-	printf("%s.%03llu EXEC pid=%-7u ppid=%-7u uid=%-5u comm=%.16s file=%.256s cgroup=%llu\n",
-	       ts, (e->timestamp_ns / 1000000ULL) % 1000ULL,
-	       e->pid, e->ppid, e->uid, e->comm, e->filename,
+	strftime(out, n, "%H:%M:%S", &tm);
+	size_t len = strlen(out);
+	snprintf(out + len, n - len, ".%03llu",
+		 (ts_ns / 1000000ULL) % 1000ULL);
+}
+
+static void print_human(const struct exec_event *e)
+{
+	char ts[32];
+
+	fmt_ts(ts, sizeof(ts), e->timestamp_ns);
+	printf("%s EXEC pid=%-7u ppid=%-7u uid=%-5u comm=%.16s file=%.256s cgroup=%llu\n",
+	       ts, e->pid, e->ppid, e->uid, e->comm, e->filename,
 	       (unsigned long long)e->cgroup_id);
 }
 
@@ -165,28 +180,21 @@ static void fmt_ns(char *out, size_t n, __u64 ns)
 		snprintf(out, n, "%lluns", (unsigned long long)ns);
 }
 
-static const char *io_kind_str(__u32 kind)
+static const char *io_kind_str(__u32 kind, bool json)
 {
-	return kind == SCOPE_IO_READ ? "READ" : "WRITE";
-}
-
-static const char *io_kind_json(__u32 kind)
-{
-	return kind == SCOPE_IO_READ ? "read" : "write";
+	if (kind == SCOPE_IO_READ)
+		return json ? "read" : "READ";
+	return json ? "write" : "WRITE";
 }
 
 static void print_io_human(const struct scope_io_event *e)
 {
 	char ts[32], lat[32];
-	time_t sec = (time_t)(e->timestamp_ns / 1000000000ULL);
-	struct tm tm;
 
-	localtime_r(&sec, &tm);
-	strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
+	fmt_ts(ts, sizeof(ts), e->timestamp_ns);
 	fmt_ns(lat, sizeof(lat), e->delta_ns);
-	printf("%s.%03llu IO  %-5s pid=%-7u tid=%-7u comm=%.16s bytes=%-11lld %s file=%s/%s\n",
-	       ts, (e->timestamp_ns / 1000000ULL) % 1000ULL,
-	       io_kind_str(e->kind), e->pid, e->tid, e->comm,
+	printf("%s IO  %-5s pid=%-7u tid=%-7u comm=%.16s bytes=%-11lld %s file=%s/%s\n",
+	       ts, io_kind_str(e->kind, false), e->pid, e->tid, e->comm,
 	       (long long)e->bytes, lat, e->dirname, e->filename);
 }
 
@@ -196,7 +204,7 @@ static void print_io_json(const struct scope_io_event *e)
 	       "\"op\":\"%s\",\"fd\":%u,\"bytes\":%lld,\"latency_ns\":%llu,"
 	       "\"comm\":",
 	       (unsigned long long)e->timestamp_ns, e->pid, e->tid,
-	       io_kind_json(e->kind), e->fd, (long long)e->bytes,
+	       io_kind_str(e->kind, true), e->fd, (long long)e->bytes,
 	       (unsigned long long)e->delta_ns);
 	json_escape(stdout, e->comm, sizeof(e->comm));
 	printf(",\"file\":");
@@ -505,6 +513,7 @@ int main(int argc, char **argv)
 	cfg.self_pid = (__u32)getpid();
 	cfg.target_cgroup_id = opt.cgroup_id;
 	cfg.min_latency_ns = opt.min_latency_ns;
+	cfg.min_io_bytes = opt.min_io_bytes;
 	if (bpf_map__update_elem(skel->maps.scope_cfg, &zero, sizeof(zero),
 				 &cfg, sizeof(cfg), BPF_ANY)) {
 		fprintf(stderr, "config map update failed: %s\n", strerror(errno));

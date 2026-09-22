@@ -175,16 +175,16 @@ struct {
  *  stays silent. Exactly one event per sampled op on every kernel. */
 
 enum io_source {
-	IO_SRC_SYSCALL = 1,	/* file resolved from fd at exit */
-	IO_SRC_VFS = 2,		/* direct struct file * from vfs layer */
+	SCOPE_IO_SRC_SYSCALL = 1,	/* file resolved from fd at exit */
+	SCOPE_IO_SRC_VFS = 2,		/* direct struct file * from vfs layer */
 };
 
 /* Per-thread I/O start. LRU so a thread that dies inside a syscall/vfs
  * call cannot leak entries. */
 struct io_start {
 	__u64 ts;
-	__u64 file;	/* IO_SRC_VFS: arg0 of vfs_{read,write} */
-	__u32 fd;	/* IO_SRC_SYSCALL: fd from the syscall */
+	__u64 file;	/* SCOPE_IO_SRC_VFS: arg0 of vfs_{read,write} */
+	__u32 fd;	/* SCOPE_IO_SRC_SYSCALL: fd from the syscall */
 	__u32 source;	/* enum io_source */
 };
 
@@ -220,6 +220,19 @@ static __always_inline __u64 fd_to_file(unsigned int fd)
 	return (__u64)file;
 }
 
+/* The four I/O syscalls traced at the raw-syscall layer (x86_64 nrs). */
+static __always_inline bool is_io_nr(__u32 nr)
+{
+	return nr == SCOPE_NR_read || nr == SCOPE_NR_pread64 ||
+	       nr == SCOPE_NR_write || nr == SCOPE_NR_pwrite64;
+}
+
+static __always_inline __u32 io_kind_of(__u32 nr)
+{
+	return (nr == SCOPE_NR_read || nr == SCOPE_NR_pread64) ?
+		SCOPE_IO_READ : SCOPE_IO_WRITE;
+}
+
 /* Exit side (shared by the sys_exit tracepoint and the vfs kretprobes):
  * consume the slot, resolve the file (direct or via fd), apply the -l
  * latency threshold, emit. Whichever exit gets here first wins; the
@@ -248,12 +261,25 @@ static __always_inline int io_emit(long ret, __u32 kind)
 	now = bpf_ktime_get_ns();
 	delta = now - st->ts;
 
-	/* -l MIN_LATENCY_US: only slow I/O crosses to userspace. */
+	/* -l MIN_LATENCY_US / -b MIN_BYTES thresholds. Emit rule: if no
+	 * threshold is active, emit everything; otherwise emit iff the op
+	 * crosses at least one active threshold. So: skip iff some
+	 * threshold is active AND every active threshold is missed
+	 * (implication per active criterion). */
 	cfg = bpf_map_lookup_elem(&scope_cfg, &zero);
-	if (cfg && cfg->min_latency_ns && delta < cfg->min_latency_ns)
-		return 0;
+	if (cfg) {
+		bool lat_active = cfg->min_latency_ns != 0;
+		bool bytes_active = cfg->min_io_bytes != 0;
+		bool lat_missed = delta < cfg->min_latency_ns;
+		bool bytes_missed = (__u64)ret < cfg->min_io_bytes;
 
-	file_val = st->source == IO_SRC_VFS ? st->file : fd_to_file(st->fd);
+		if ((lat_active || bytes_active) &&
+		    (!lat_active || lat_missed) &&
+		    (!bytes_active || bytes_missed))
+			return 0;
+	}
+
+	file_val = st->source == SCOPE_IO_SRC_VFS ? st->file : fd_to_file(st->fd);
 	file = (const struct file *)file_val;
 
 	dentry = NULL;
@@ -356,8 +382,7 @@ int handle_sys_enter(struct trace_event_raw_sys_enter *ctx)
 	 * six syscall args directly, stable across all kernels (unlike
 	 * kprobes on __x64_sys_*, which switched to a pt_regs * argument
 	 * in 7.x and silently corrupted fd reads). */
-	if (nr == SCOPE_NR_read || nr == SCOPE_NR_pread64 ||
-	    nr == SCOPE_NR_write || nr == SCOPE_NR_pwrite64) {
+	if (is_io_nr(nr)) {
 		struct io_start st;
 		unsigned long fd;
 
@@ -365,7 +390,7 @@ int handle_sys_enter(struct trace_event_raw_sys_enter *ctx)
 		st.ts = now;
 		st.file = 0;
 		st.fd = (__u32)fd;
-		st.source = IO_SRC_SYSCALL;
+		st.source = SCOPE_IO_SRC_SYSCALL;
 		bpf_map_update_elem(&io_start, &tid, &st, BPF_ANY);
 	}
 	return 0;
@@ -381,14 +406,23 @@ int handle_sys_exit(struct trace_event_raw_sys_exit *ctx)
 	__u32 tid, nr, slot;
 
 	tid = (__u32)bpf_get_current_pid_tgid();
-	start = bpf_map_lookup_elem(&sys_start, &tid);
-	if (!start)
-		return 0; /* unsampled, filtered, or enter lost to eviction */
-	delta = bpf_ktime_get_ns() - *start;
-	bpf_map_delete_elem(&sys_start, &tid);
 
 	BPF_CORE_READ_INTO(&sys_id, ctx, id);
 	nr = (__u32)sys_id;
+
+	start = bpf_map_lookup_elem(&sys_start, &tid);
+	if (!start) {
+		/* Enter never ran (gated out) or its sys_start entry was
+		 * evicted: any io_start slot for this tid is stranded
+		 * garbage, not this op's — drop it so the next op can't
+		 * inherit a stale fd. */
+		if (is_io_nr(nr))
+			bpf_map_delete_elem(&io_start, &tid);
+		return 0;
+	}
+	delta = bpf_ktime_get_ns() - *start;
+	bpf_map_delete_elem(&sys_start, &tid);
+
 	if (nr >= SCOPE_MAX_SYSCALL_NR)
 		return 0;
 
@@ -404,24 +438,24 @@ int handle_sys_exit(struct trace_event_raw_sys_exit *ctx)
 	if (!h) {
 		bpf_map_update_elem(&sys_hist, &nr, &zero, BPF_NOEXIST);
 		h = bpf_map_lookup_elem(&sys_hist, &nr);
-		if (!h)
-			return 0;
 	}
 	/* Per-CPU value: plain increments, race-free on this CPU. The
-	 * slot index is bounded by the clamp above (verifier-visible). */
-	h->slots[slot] += 1;
-	h->count += 1;
-	h->total_ns += delta;
+	 * slot index is bounded by the clamp above (verifier-visible).
+	 * h == NULL is only reachable under map pressure; skip the
+	 * histogram then (never skip the I/O slot consume below — a
+	 * stranded io_start slot would misattribute the next op). */
+	if (h) {
+		h->slots[slot] += 1;
+		h->count += 1;
+		h->total_ns += delta;
+	}
 
 	/* Phase 3: syscall-layer I/O exit. The vfs-layer kretprobes (when
 	 * they fire — <= 6.x) already consumed the slot; on 7.x reads this
-	 * is the only consumer. */
-	if (nr == SCOPE_NR_read || nr == SCOPE_NR_pread64) {
+	 * is the only consumer. Always runs for I/O syscalls (see above). */
+	if (is_io_nr(nr)) {
 		BPF_CORE_READ_INTO(&ret, ctx, ret);
-		io_emit(ret, SCOPE_IO_READ);
-	} else if (nr == SCOPE_NR_write || nr == SCOPE_NR_pwrite64) {
-		BPF_CORE_READ_INTO(&ret, ctx, ret);
-		io_emit(ret, SCOPE_IO_WRITE);
+		io_emit(ret, io_kind_of(nr));
 	}
 	return 0;
 }
@@ -442,7 +476,7 @@ static __always_inline int io_enter_vfs(struct file *file)
 	nst.ts = bpf_ktime_get_ns();
 	nst.file = (__u64)file;
 	nst.fd = st->fd;
-	nst.source = IO_SRC_VFS;
+	nst.source = SCOPE_IO_SRC_VFS;
 	bpf_map_update_elem(&io_start, &tid, &nst, BPF_ANY);
 	return 0;
 }

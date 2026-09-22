@@ -42,6 +42,7 @@ struct scope_config {
 	__u32 _pad;
 	__u64 target_cgroup_id;	/* 0 = all cgroups */
 	__u64 min_latency_ns;	/* I/O latency threshold (-l) */
+	__u64 min_io_bytes;	/* I/O size threshold (-b), 0 = none */
 };
 
 /* SCOPE_EVENT_EXEC payload: one successful exec(). */

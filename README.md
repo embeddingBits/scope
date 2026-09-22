@@ -64,7 +64,7 @@ What `make build` does, in order:
 ## Usage
 
 ```text
-sudo ./scope [-p PID] [-c CGROUP_PATH] [-s SAMPLE_RATE] [-l MIN_LATENCY_US] [-o json | --no-ui] [-v]
+sudo ./scope [-p PID] [-c CGROUP_PATH] [-s SAMPLE_RATE] [-l MIN_LATENCY_US] [-b MIN_BYTES] [-o json | --no-ui] [-v]
 ```
 
 Examples:
@@ -75,6 +75,8 @@ sudo ./scope -o json                      # JSON lines for piping (same as --no-
 sudo ./scope -p 1234                      # execs by PID 1234 AND children it spawns
 sudo ./scope -c /sys/fs/cgroup/app.slice  # only that cgroup (path -> id via st_ino)
 sudo ./scope -s 10                        # sample ~1-in-10 events
+sudo ./scope -l 5000                      # only I/O slower than 5 ms
+sudo ./scope -b 1048576                   # only I/O of 1 MiB or more
 sudo ./scope -v                           # verbose libbpf log (loader/verifier output)
 ```
 
@@ -84,8 +86,14 @@ interval event count/rate and, per syscall, count, rate, avg and
 p50/p90/p99 latency from the in-kernel log2 histogram (JSON mode emits
 `{"type":"syscalls", ...}` records instead). File I/O events stream as
 `IO READ/WRITE pid=.. tid=.. comm=.. bytes=.. lat file=dir/name`
-(`{"type":"io", ...}` in JSON). `-l N` drops I/O events faster than
-N microseconds.
+(`{"type":"io", ...}` in JSON).
+
+`-l N` / `-b N` gate I/O emission: with no thresholds everything
+emits; with thresholds, an op emits iff it crosses at least one of
+them (slow **or** big). The latency threshold applies to I/O events
+only — syscall activity is aggregated into histograms, never emitted
+per event, so a latency threshold there would be meaningless by
+design.
 
 ## Architecture
 
@@ -220,6 +228,23 @@ Resolution: the syscall layer now uses the `raw_syscalls` tracepoints'
 vfs_read/vfs_write kprobes remain as a refinement layer that overwrites
 the per-thread slot where they still fire. The dedup scheme guarantees
 exactly one event per I/O op on any kernel.
+
+Consequences, stated as deviations:
+
+- **`bpf_core_field_exists()` is unused.** The brief asked to guard
+  optional fields with it where kernel versions differ. The 7.x
+  differences found were structural (function signatures, dispatch
+  paths), not optional struct fields, so they were handled
+  architecturally instead. No optional field access exists in the code.
+- **Latency scoping differs per kernel.** On <= 6.x, I/O latency is
+  vfs-scoped (vfs entry -> exit); on 7.x, reads are syscall-scoped
+  (sys_enter -> sys_exit) because vfs_read never fires. `-l` compares
+  the same order of magnitude on both, but they are not identical
+  quantities.
+- **Failed/EOF I/O is dropped** (ret <= 0 emits nothing) — "bytes
+  moved" only makes sense for completed reads/writes.
+- **`min_latency_ns` gates I/O events only**; syscall latency is
+  histogrammed in-kernel and never emitted per event (see Usage).
 
 ## Known limitations (Phases 1–3)
 
