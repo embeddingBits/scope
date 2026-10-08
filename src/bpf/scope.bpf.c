@@ -1,9 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * scope.bpf.c — Scope's kernel-side programs (CO-RE, libbpf).
- *
- * Phase 1: sched_process_exec tracepoint -> ringbuf. Later phases append
- * syscall, I/O and TCP programs to this file (or split it once it grows).
+ * scope.bpf.c holds Scope kernel-side programs (CO-RE, libbpf).
  *
  * CO-RE rules followed throughout:
  *  - all kernel struct access via BPF_CORE_READ* (never direct deref),
@@ -18,7 +15,6 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
-/* Primary event channel: single ringbuf, 256 KiB. */
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 256 * 1024);
@@ -33,14 +29,50 @@ struct {
 } scope_cfg SEC(".maps");
 
 /*
+ * Filter gate. One module shared by every program. Each check is a small
+ * predicate so the gate reads the same at every attach point. The sampling
+ * dice roll lives here only, so enter and exit can never disagree on it.
+ */
+static __always_inline bool pid_match(__u32 a, __u32 b, __u32 target)
+{
+	if (!target)
+		return true;
+	return a == target || b == target;
+}
+
+static __always_inline bool cgroup_match(struct scope_config *cfg)
+{
+	if (!cfg->target_cgroup_id)
+		return true;
+	return bpf_get_current_cgroup_id() == cfg->target_cgroup_id;
+}
+
+static __always_inline bool self_ok(__u32 tgid, struct scope_config *cfg)
+{
+	/* Never trace ourselves: every emitted event is itself a stdout
+	 * write, which would re-enter this pipeline and flood the ringbuf
+	 * in a feedback loop (seen in practice: gigabytes in seconds). */
+	if (!cfg->self_pid)
+		return true;
+	return tgid != cfg->self_pid;
+}
+
+static __always_inline bool sample_ok(struct scope_config *cfg)
+{
+	if (cfg->sample_rate <= 1)
+		return true;
+	return bpf_get_prandom_u32() % cfg->sample_rate == 0;
+}
+
+/*
  * The ctx type is the kernel's own `struct trace_event_raw_sched_process_exec`
  * from vmlinux.h. This is deliberate: CO-RE relocates types matched BY NAME
  * against kernel BTF, so a renamed local struct (even layout-identical)
  * fails relocation at load. Lesson learned from verifier output.
  *
  * `__data_loc_filename` packs (len << 16 | offset): the string lives at
- * (void *)ctx + (data_loc & 0xffff). Resolved manually — exact per the
- * trace ABI, no guessing at pointer semantics.
+ * (void *)ctx + (data_loc & 0xffff). Resolved manually per the trace ABI,
+ * no guessing at pointer semantics.
  */
 SEC("tracepoint/sched/sched_process_exec")
 int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
@@ -55,7 +87,6 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 	__u64 pid_tgid, uid_gid;
 	__u32 pid;
 
-	/* 1. Config check first: cheapest possible filter. */
 	cfg = bpf_map_lookup_elem(&scope_cfg, &zero);
 	if (!cfg)
 		return 0;
@@ -71,29 +102,25 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 		BPF_CORE_READ_INTO(&fparent, ftask, real_parent);
 		if (fparent)
 			BPF_CORE_READ_INTO(&ppid, fparent, tgid);
-		if (pid != cfg->target_pid && ppid != cfg->target_pid)
+		if (!pid_match(pid, ppid, cfg->target_pid))
 			return 0;
 		have_ppid = true;
 	}
 
-	if (cfg->target_cgroup_id) {
-		__u64 cg = bpf_get_current_cgroup_id();
+	if (!cgroup_match(cfg))
+		return 0;
 
-		if (cg != cfg->target_cgroup_id)
-			return 0;
-	}
+	if (!self_ok(pid, cfg))
+		return 0;
 
-	if (cfg->sample_rate > 1) {
-		if (bpf_get_prandom_u32() % cfg->sample_rate != 0)
-			return 0;
-	}
+	if (!sample_ok(cfg))
+		return 0;
 
-	/* 2. Reserve ringbuf space (drop on pressure, never block). */
+	/* Drops the event under backpressure instead of blocking. */
 	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (!e)
 		return 0;
 
-	/* 3. Fill the event. */
 	e->type = SCOPE_EVENT_EXEC;
 	e->_pad = 0;
 	e->data.exec.timestamp_ns = bpf_ktime_get_ns();
@@ -116,7 +143,6 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 
 	bpf_get_current_comm(&e->data.exec.comm, sizeof(e->data.exec.comm));
 
-	/* Filename from the __data_loc offset. */
 	BPF_CORE_READ_INTO(&data_loc, ctx, __data_loc_filename);
 	fname = (const char *)ctx + (data_loc & 0xffff);
 	if (bpf_probe_read_kernel_str(&e->data.exec.filename,
@@ -128,8 +154,7 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 	return 0;
 }
 
-/* Per-thread syscall start times, keyed by tid. LRU so a thread that
- * dies inside a syscall cannot leak entries and evict live ones. */
+/* LRU so a thread that dies mid-syscall cannot leak entries. */
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 10240);
@@ -137,9 +162,8 @@ struct {
 	__type(value, __u64);
 } sys_start SEC(".maps");
 
-/* Per-syscall log2 latency histograms. PERCPU: updates are plain
- * increments on the local CPU, no atomics, no cross-CPU traffic;
- * userspace sums across CPUs on read. */
+/* PERCPU so updates are plain increments on the local CPU.
+ * Userspace sums across CPUs on read. */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
 	__uint(max_entries, SCOPE_MAX_SYSCALL_NR);
@@ -147,15 +171,12 @@ struct {
 	__type(value, struct sys_hist);
 } sys_hist SEC(".maps");
 
-/* ---- Phase 3: file I/O infrastructure (maps + helpers used by the
- * raw_syscalls programs above and the vfs kprobes below) ---- */
-
 /* Two layers, one per-thread slot:
  *
  *  - syscall layer: the raw_syscalls sys_enter/sys_exit tracepoints
- *    (same programs as the Phase 2 histograms). args[0] is the fd for
- *    read/write/pread64/pwrite64, and this ABI is stable on every kernel
- *    — deliberately NOT kprobes on __x64_sys_*: kernel 7.x changed those
+ *    (the same programs that feed the latency histograms). args[0] is the fd for
+ *    read/write/pread64/pwrite64, and this ABI is stable on every kernel.
+ *    It is deliberately not kprobes on __x64_sys_*: kernel 7.x changed those
  *    functions to take `struct pt_regs *` instead of expanded args (BTF
  *    on 7.2.2: FUNC_PROTO '__x64_sys_pread64' vlen=1 'regs'), so an
  *    arg0-based fd read silently yields the regs pointer there.
@@ -171,7 +192,7 @@ struct {
  *  entry. A vfs entry fires only if a syscall-layer entry created the
  *  slot (lookup-first, no second dice roll), then overwrites it. Whichever
  *  exit fires first (the inner vfs one on <= 6.x, the syscall one on
- *  7.x reads) consumes the slot and emits — the other finds it gone and
+ *  7.x reads) consumes the slot and emits. The other finds it gone and
  *  stays silent. Exactly one event per sampled op on every kernel. */
 
 enum io_source {
@@ -195,7 +216,6 @@ struct {
 	__type(value, struct io_start);
 } io_start SEC(".maps");
 
-/* Resolve struct file * from an fd: current->files->fdt->fd[fd]. */
 static __always_inline __u64 fd_to_file(unsigned int fd)
 {
 	struct task_struct *task;
@@ -220,7 +240,6 @@ static __always_inline __u64 fd_to_file(unsigned int fd)
 	return (__u64)file;
 }
 
-/* The four I/O syscalls traced at the raw-syscall layer (x86_64 nrs). */
 static __always_inline bool is_io_nr(__u32 nr)
 {
 	return nr == SCOPE_NR_read || nr == SCOPE_NR_pread64 ||
@@ -233,10 +252,9 @@ static __always_inline __u32 io_kind_of(__u32 nr)
 		SCOPE_IO_READ : SCOPE_IO_WRITE;
 }
 
-/* Exit side (shared by the sys_exit tracepoint and the vfs kretprobes):
- * consume the slot, resolve the file (direct or via fd), apply the -l
- * latency threshold, emit. Whichever exit gets here first wins; the
- * other finds the slot gone. */
+/* Shared exit for the sys_exit tracepoint and the vfs kretprobes.
+ * Whichever exit gets here first consumes the slot and emits.
+ * The other finds the slot gone and stays silent. */
 static __always_inline int io_emit(long ret, __u32 kind)
 {
 	struct io_start *st;
@@ -252,20 +270,19 @@ static __always_inline int io_emit(long ret, __u32 kind)
 	tid = (__u32)bpf_get_current_pid_tgid();
 	st = bpf_map_lookup_elem(&io_start, &tid);
 	if (!st)
-		return 0; /* gated, or the inner vfs exit already consumed */
+		return 0;
 	bpf_map_delete_elem(&io_start, &tid);
 
+	/* Errors and EOF move no bytes, so there is nothing to report. */
 	if (ret <= 0)
-		return 0; /* errors/EOF carry no bytes */
+		return 0;
 
 	now = bpf_ktime_get_ns();
 	delta = now - st->ts;
 
-	/* -l MIN_LATENCY_US / -b MIN_BYTES thresholds. Emit rule: if no
-	 * threshold is active, emit everything; otherwise emit iff the op
-	 * crosses at least one active threshold. So: skip iff some
-	 * threshold is active AND every active threshold is missed
-	 * (implication per active criterion). */
+	/* Emit rule: with no thresholds active, emit everything.
+	 * Otherwise emit when the op crosses at least one active threshold
+	 * (slow or big). */
 	cfg = bpf_map_lookup_elem(&scope_cfg, &zero);
 	if (cfg) {
 		bool lat_active = cfg->min_latency_ns != 0;
@@ -286,9 +303,8 @@ static __always_inline int io_emit(long ret, __u32 kind)
 	name = NULL;
 	parent = NULL;
 	pname = NULL;
-	/* CO-RE chains; probe_read-based, NULL-checked after each hop.
-	 * Deliberately shallow: dentry name + one-hop parent name; full
-	 * path resolution is userspace work (later phases). */
+	/* Only the dentry name plus one-hop parent name. Full path
+	 * resolution is userspace work. */
 	if (file) {
 		BPF_CORE_READ_INTO(&dentry, file, f_path.dentry);
 		if (dentry) {
@@ -349,26 +365,16 @@ int handle_sys_enter(struct trace_event_raw_sys_enter *ctx)
 	tid = (__u32)pid_tgid;
 	tgid = (__u32)(pid_tgid >> 32);
 
-	/* Match tid OR tgid: one -p flag covers all threads of a process. */
-	if (cfg->target_pid && tid != cfg->target_pid &&
-	    tgid != cfg->target_pid)
+	if (!pid_match(tid, tgid, cfg->target_pid))
 		return 0;
 
-	if (cfg->target_cgroup_id &&
-	    bpf_get_current_cgroup_id() != cfg->target_cgroup_id)
+	if (!cgroup_match(cfg))
 		return 0;
 
-	/* Never trace ourselves: every emitted event is itself a stdout
-	 * write, which would re-enter this pipeline and flood the ringbuf
-	 * in a feedback loop (seen in practice: 7.5 GB in seconds). */
-	if (cfg->self_pid && tgid == cfg->self_pid)
+	if (!self_ok(tgid, cfg))
 		return 0;
 
-	/* The sampling gate lives ONLY here. Exit is driven by the presence
-	 * of a start entry, so enter/exit can never disagree on the
-	 * decision — no torn samples, no map leaks from skipped exits. */
-	if (cfg->sample_rate > 1 &&
-	    bpf_get_prandom_u32() % cfg->sample_rate != 0)
+	if (!sample_ok(cfg))
 		return 0;
 
 	BPF_CORE_READ_INTO(&sys_id, ctx, id);
@@ -377,8 +383,8 @@ int handle_sys_enter(struct trace_event_raw_sys_enter *ctx)
 	now = bpf_ktime_get_ns();
 	bpf_map_update_elem(&sys_start, &tid, &now, BPF_ANY);
 
-	/* Phase 3: syscall-layer I/O start. args[0] is the fd for
-	 * read/write/pread64/pwrite64 — the raw tracepoint ABI carries the
+	/* Syscall-layer I/O start. args[0] is the fd for
+	 * read/write/pread64/pwrite64. The raw tracepoint ABI carries the
 	 * six syscall args directly, stable across all kernels (unlike
 	 * kprobes on __x64_sys_*, which switched to a pt_regs * argument
 	 * in 7.x and silently corrupted fd reads). */
@@ -414,7 +420,7 @@ int handle_sys_exit(struct trace_event_raw_sys_exit *ctx)
 	if (!start) {
 		/* Enter never ran (gated out) or its sys_start entry was
 		 * evicted: any io_start slot for this tid is stranded
-		 * garbage, not this op's — drop it so the next op can't
+		 * garbage, not this op's. Drop it so the next op cannot
 		 * inherit a stale fd. */
 		if (is_io_nr(nr))
 			bpf_map_delete_elem(&io_start, &tid);
@@ -442,7 +448,7 @@ int handle_sys_exit(struct trace_event_raw_sys_exit *ctx)
 	/* Per-CPU value: plain increments, race-free on this CPU. The
 	 * slot index is bounded by the clamp above (verifier-visible).
 	 * h == NULL is only reachable under map pressure; skip the
-	 * histogram then (never skip the I/O slot consume below — a
+	 * histogram then (never skip the I/O slot consume below, since a
 	 * stranded io_start slot would misattribute the next op). */
 	if (h) {
 		h->slots[slot] += 1;
@@ -450,8 +456,8 @@ int handle_sys_exit(struct trace_event_raw_sys_exit *ctx)
 		h->total_ns += delta;
 	}
 
-	/* Phase 3: syscall-layer I/O exit. The vfs-layer kretprobes (when
-	 * they fire — <= 6.x) already consumed the slot; on 7.x reads this
+	/* Syscall-layer I/O exit. The vfs-layer kretprobes (when they fire
+	 * on <= 6.x) already consumed the slot; on 7.x reads this
 	 * is the only consumer. Always runs for I/O syscalls (see above). */
 	if (is_io_nr(nr)) {
 		BPF_CORE_READ_INTO(&ret, ctx, ret);
@@ -461,7 +467,7 @@ int handle_sys_exit(struct trace_event_raw_sys_exit *ctx)
 }
 
 /* vfs layer: refine an existing syscall-layer slot with the direct file
- * pointer. Presence-driven — no gate re-roll, no slot creation. */
+ * pointer. Presence-driven, so no gate re-roll and no slot creation. */
 static __always_inline int io_enter_vfs(struct file *file)
 {
 	struct io_start *st;
@@ -471,7 +477,7 @@ static __always_inline int io_enter_vfs(struct file *file)
 	tid = (__u32)bpf_get_current_pid_tgid();
 	st = bpf_map_lookup_elem(&io_start, &tid);
 	if (!st)
-		return 0; /* gated out at syscall layer (or layer absent) */
+		return 0;
 
 	nst.ts = bpf_ktime_get_ns();
 	nst.file = (__u64)file;

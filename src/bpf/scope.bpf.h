@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * scope.bpf.h — shared ABI between BPF kernel programs and userspace.
+ * scope.bpf.h holds the shared ABI between BPF programs and userspace.
  *
  * Included by both scope.bpf.c (compiled with -target bpf) and scope.c
  * (normal userspace compile). Must stay POD, fixed-size, and stable:
@@ -14,26 +14,26 @@
 
 #ifndef __BPF__
 /* Kernel __u8..__s64 types (also pulled in by the bpftool skeleton
- * via libbpf headers — include it here so we never redefine them). */
+ * via libbpf headers; include it here so we never redefine them). */
 #include <linux/types.h>
 #endif
 
 #define SCOPE_COMM_LEN     16
 #define SCOPE_FILENAME_LEN 256
 
-/* Wire event discriminator. New event kinds are appended in later phases;
- * old values never change meaning. */
+/* Wire event discriminator. New event kinds are appended here.
+ * Old values never change meaning. */
 enum scope_event_type {
-	SCOPE_EVENT_EXEC = 1,	/* struct exec_event (Phase 1) */
-	SCOPE_EVENT_EXIT = 2,	/* reserved: Phase 2+ */
-	SCOPE_EVENT_IO   = 3,	/* reserved: Phase 3 */
-	SCOPE_EVENT_TCP  = 4,	/* reserved: Phase 4 */
+	SCOPE_EVENT_EXEC = 1,	/* struct exec_event */
+	SCOPE_EVENT_EXIT = 2,	/* reserved */
+	SCOPE_EVENT_IO   = 3,	/* struct scope_io_event */
+	SCOPE_EVENT_TCP  = 4,	/* reserved */
 };
 
 /*
  * Global in-kernel config, single entry in the scope_cfg ARRAY map.
- * Every BPF program reads this FIRST and returns early on mismatch —
- * cheap early return is the #1 overhead-reduction technique.
+ * Every BPF program reads this first and returns early on mismatch.
+ * That cheap early return is the main overhead control.
  */
 struct scope_config {
 	__u32 sample_rate;	/* 1 = every event, N = emit ~1-in-N */
@@ -57,13 +57,13 @@ struct exec_event {
 	char filename[SCOPE_FILENAME_LEN];
 };
 
-/* File I/O direction (Phase 3). */
+/* File I/O direction. */
 enum scope_io_kind {
 	SCOPE_IO_READ = 1,
 	SCOPE_IO_WRITE = 2,
 };
 
-/* SCOPE_EVENT_IO payload: one completed vfs_read/vfs_write.
+/* SCOPE_EVENT_IO payload: one completed read/write op.
  * Named scope_io_event: vmlinux.h already defines `struct io_event`
  * (aio), and the BPF TU includes both headers. */
 struct scope_io_event {
@@ -79,7 +79,7 @@ struct scope_io_event {
 	char dirname[SCOPE_FILENAME_LEN]; /* d_parent name, one hop only */
 };
 
-/* Syscall latency histogram (Phase 2). One entry per syscall nr in a
+/* Syscall latency histogram. One entry per syscall nr in a
  * PERCPU_HASH: pure in-kernel aggregation, zero per-event traffic.
  * Slot s holds samples in [2^(s-1), 2^s) ns; slot 0 holds exact-zero;
  * slot 31 saturates (holds everything >= 2^30 ns). */
@@ -99,7 +99,7 @@ struct sys_hist {
 	__u64 total_ns;
 };
 
-/* Ringbuf envelope. Union grows in later phases. */
+/* Ringbuf envelope. The union grows as new event kinds land. */
 struct scope_event {
 	__u32 type;		/* enum scope_event_type */
 	__u32 _pad;
