@@ -1,4 +1,4 @@
-# Scope — Makefile
+# Scope Makefile
 #
 # Targets:
 #   deps     check build prerequisites
@@ -12,7 +12,8 @@ BPF_HDR   := $(BPF_DIR)/scope.bpf.h
 BPF_OBJ   := $(BPF_DIR)/scope.bpf.o
 VMLINUX_H := $(BPF_DIR)/vmlinux.h
 SKEL_H    := $(BPF_DIR)/scope.skel.h
-USER_SRC  := src/scope.c
+USER_SRC  := src/scope.c src/output.c src/histogram.c
+USER_HDR  := src/output.h src/histogram.h
 SYSNAMES_H := src/syscall_names.h
 SYSCALL_HDR := /usr/include/asm/unistd_64.h
 BIN       := scope
@@ -75,7 +76,7 @@ $(SKEL_H): $(BPF_OBJ)
 	@echo "== bpftool gen skeleton $@ =="
 	bpftool gen skeleton $(BPF_OBJ) > $@
 
-$(BIN): $(USER_SRC) $(SKEL_H) $(BPF_HDR) $(SYSNAMES_H)
+$(BIN): $(USER_SRC) $(USER_HDR) $(SKEL_H) $(BPF_HDR) $(SYSNAMES_H)
 	@echo "== gcc $@ =="
 	gcc -g -O2 -Wall -Wextra -Isrc -o $(BIN) $(USER_SRC) -lbpf -lelf -lz
 

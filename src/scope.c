@@ -1,9 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * scope.c — Scope userspace: load/attach BPF, poll ringbuf, print events.
- *
- * Phase 1: exec events only, human-readable lines or JSON lines
- * (--no-ui / -o json). Aggregation + TUI arrive in later phases.
+ * scope.c loads and attaches the BPF programs, polls the ring buffer,
+ * and dumps the syscall histogram once a second. Event formatting
+ * lives in output.c. Histogram math lives in histogram.c.
  */
 #include <argp.h>
 #include <bpf/bpf.h>
@@ -21,11 +20,8 @@
 
 #include "bpf/scope.bpf.h"
 #include "bpf/scope.skel.h"
-#include "syscall_names.h"
-
-#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
-
-/* ---- CLI ---- */
+#include "histogram.h"
+#include "output.h"
 
 static struct {
 	__u32 pid;
@@ -98,21 +94,16 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 static struct argp argp = {
 	.options = options,
 	.parser = parse_opt,
-	.doc = "Scope — eBPF-based Linux observability tool (Phase 1: exec tracing).\n",
+	.doc = "Scope, eBPF-based Linux observability tool.\n",
 };
-
-/* ---- libbpf logging ---- */
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *fmt,
 			   va_list args)
 {
-	/* Always show warnings/errors; debug only with -v (loader/verifier). */
 	if (level == LIBBPF_DEBUG && !opt.verbose)
 		return 0;
 	return vfprintf(stderr, fmt, args);
 }
-
-/* ---- shutdown ---- */
 
 static volatile sig_atomic_t stop;
 
@@ -120,111 +111,6 @@ static void sig_handler(int sig)
 {
 	(void)sig;
 	stop = 1;
-}
-
-/* ---- output ---- */
-
-/* Minimal JSON string escaper for comm/filename. */
-static void json_escape(FILE *f, const char *s, size_t max)
-{
-	fputc('"', f);
-	for (size_t i = 0; i < max && s[i]; i++) {
-		unsigned char c = (unsigned char)s[i];
-		switch (c) {
-		case '"': fputs("\\\"", f); break;
-		case '\\': fputs("\\\\", f); break;
-		case '\n': fputs("\\n", f); break;
-		case '\t': fputs("\\t", f); break;
-		default:
-			if (c < 0x20)
-				fprintf(f, "\\u%04x", c);
-			else
-				fputc(c, f);
-		}
-	}
-	fputc('"', f);
-}
-
-/* "HH:MM:SS.mmm" wall-clock timestamp for human lines. */
-static void fmt_ts(char *out, size_t n, __u64 ts_ns)
-{
-	time_t sec = (time_t)(ts_ns / 1000000000ULL);
-	struct tm tm;
-
-	localtime_r(&sec, &tm);
-	strftime(out, n, "%H:%M:%S", &tm);
-	size_t len = strlen(out);
-	snprintf(out + len, n - len, ".%03llu",
-		 (ts_ns / 1000000ULL) % 1000ULL);
-}
-
-static void print_human(const struct exec_event *e)
-{
-	char ts[32];
-
-	fmt_ts(ts, sizeof(ts), e->timestamp_ns);
-	printf("%s EXEC pid=%-7u ppid=%-7u uid=%-5u comm=%.16s file=%.256s cgroup=%llu\n",
-	       ts, e->pid, e->ppid, e->uid, e->comm, e->filename,
-	       (unsigned long long)e->cgroup_id);
-}
-
-static void fmt_ns(char *out, size_t n, __u64 ns)
-{
-	if (ns >= 1000000000ULL)
-		snprintf(out, n, "%.2fs", (double)ns / 1e9);
-	else if (ns >= 1000000ULL)
-		snprintf(out, n, "%.2fms", (double)ns / 1e6);
-	else if (ns >= 1000ULL)
-		snprintf(out, n, "%.2fus", (double)ns / 1e3);
-	else
-		snprintf(out, n, "%lluns", (unsigned long long)ns);
-}
-
-static const char *io_kind_str(__u32 kind, bool json)
-{
-	if (kind == SCOPE_IO_READ)
-		return json ? "read" : "READ";
-	return json ? "write" : "WRITE";
-}
-
-static void print_io_human(const struct scope_io_event *e)
-{
-	char ts[32], lat[32];
-
-	fmt_ts(ts, sizeof(ts), e->timestamp_ns);
-	fmt_ns(lat, sizeof(lat), e->delta_ns);
-	printf("%s IO  %-5s pid=%-7u tid=%-7u comm=%.16s bytes=%-11lld %s file=%s/%s\n",
-	       ts, io_kind_str(e->kind, false), e->pid, e->tid, e->comm,
-	       (long long)e->bytes, lat, e->dirname, e->filename);
-}
-
-static void print_io_json(const struct scope_io_event *e)
-{
-	printf("{\"type\":\"io\",\"ts\":%llu,\"pid\":%u,\"tid\":%u,"
-	       "\"op\":\"%s\",\"fd\":%u,\"bytes\":%lld,\"latency_ns\":%llu,"
-	       "\"comm\":",
-	       (unsigned long long)e->timestamp_ns, e->pid, e->tid,
-	       io_kind_str(e->kind, true), e->fd, (long long)e->bytes,
-	       (unsigned long long)e->delta_ns);
-	json_escape(stdout, e->comm, sizeof(e->comm));
-	printf(",\"file\":");
-	json_escape(stdout, e->filename, sizeof(e->filename));
-	printf(",\"dir\":");
-	json_escape(stdout, e->dirname, sizeof(e->dirname));
-	printf("}\n");
-}
-
-static void print_json(const struct exec_event *e)
-{
-	printf("{\"type\":\"exec\",\"ts\":%llu,\"pid\":%u,\"ppid\":%u,"
-	       "\"uid\":%u,\"gid\":%u,\"cgroup_id\":%llu,\"comm\":",
-	       (unsigned long long)e->timestamp_ns,
-	       e->pid, e->ppid, e->uid, e->gid,
-	       (unsigned long long)e->cgroup_id);
-	json_escape(stdout, e->comm, sizeof(e->comm));
-	printf(",\"filename\":");
-	json_escape(stdout, e->filename, sizeof(e->filename));
-	printf("}\n");
 }
 
 static int handle_event(void *ctx, void *data, size_t len)
@@ -236,120 +122,15 @@ static int handle_event(void *ctx, void *data, size_t len)
 		fprintf(stderr, "truncated event (%zu bytes), dropped\n", len);
 		return 0;
 	}
-	switch (ev->type) {
-	case SCOPE_EVENT_EXEC:
-		if (opt.json)
-			print_json(&ev->data.exec);
-		else
-			print_human(&ev->data.exec);
-		break;
-	case SCOPE_EVENT_IO:
-		if (opt.json)
-			print_io_json(&ev->data.io);
-		else
-			print_io_human(&ev->data.io);
-		break;
-	default:
+	if (output_event(ev, opt.json) != 0)
 		fprintf(stderr, "unknown event type %u, dropped\n", ev->type);
-		return 0;
-	}
 	fflush(stdout);
 	return 0;
 }
 
-/* ---- syscall histogram (Phase 2) ---- */
-
-/* syscalls are in-kernel aggregated into PERCPU_HASH; userspace sums the
- * per-CPU values once per second, diffs against the previous snapshot to
- * get interval rates, and reports percentiles from the slot histograms. */
-
-static const char *syscall_name(__u32 nr)
-{
-	if (nr < ARRAY_SIZE(syscall_names) && syscall_names[nr])
-		return syscall_names[nr];
-	/* unknown/unused nr: rotating static buffers (cheap, thread-local
-	 * single-threaded context) */
-	static char buf[4][16];
-	static unsigned idx;
-	char *b = buf[idx++ % 4];
-	snprintf(b, 16, "sys_%u", nr);
-	return b;
-}
-
-/* Upper bound of histogram slot s in ns: slot s covers [2^(s-1), 2^s).
- * Slot 0 is exact zero; slot 31 saturates (>= 2^30 ns). */
-static __u64 slot_upper_ns(int s)
-{
-	if (s <= 0)
-		return 0;
-	return 1ULL << s;
-}
-
-static __u64 percentile_ns(const __u64 *slots, __u64 count, double p)
-{
-	__u64 target, cum = 0;
-	int s;
-
-	if (count == 0)
-		return 0;
-	target = (__u64)((double)count * p);
-	if (target == 0)
-		target = 1;
-	for (s = 0; s < SCOPE_HIST_SLOTS; s++) {
-		cum += slots[s];
-		if (cum >= target)
-			return slot_upper_ns(s);
-	}
-	return slot_upper_ns(SCOPE_HIST_SLOTS - 1);
-}
-
-/* One aggregated syscall row. `delta` is the interval diff of the
- * in-kernel histogram; percentiles are computed on it. */
-struct sys_row {
-	__u32 nr;
-	const char *name;
-	struct sys_hist delta;
-	__u64 avg_ns, p50_ns, p90_ns, p99_ns;
-};
-
-static int row_cmp(const void *a, const void *b)
-{
-	const struct sys_row *ra = *(struct sys_row *const *)a;
-	const struct sys_row *rb = *(struct sys_row *const *)b;
-
-	if (ra->delta.count < rb->delta.count)
-		return 1;
-	if (ra->delta.count > rb->delta.count)
-		return -1;
-	return 0;
-}
-
-/* libbpf lays percpu map values out with stride roundup(value_size, 8). */
-static size_t percpu_stride(size_t vsize)
-{
-	return (vsize + 7) & ~7UL;
-}
-
-/* Sum one PERCPU_HASH value across CPUs. */
-static void sum_percpu(const void *vals, int ncpus, size_t vsize,
-		       struct sys_hist *out)
-{
-	size_t stride = percpu_stride(vsize);
-
-	memset(out, 0, sizeof(*out));
-	for (int cpu = 0; cpu < ncpus; cpu++) {
-		const struct sys_hist *h =
-			(const struct sys_hist *)((const char *)vals +
-						 cpu * stride);
-		for (int s = 0; s < SCOPE_HIST_SLOTS; s++)
-			out->slots[s] += h->slots[s];
-		out->count += h->count;
-		out->total_ns += h->total_ns;
-	}
-}
-
-#define TOP_N 10
-
+/* Reads the live histogram map (the prod adapter) and hands plain
+ * snapshots to the histogram module. Tests feed recorded snapshots
+ * to the same interface without touching the kernel. */
 static void dump_syscalls(struct scope_bpf *skel, bool json,
 			  struct timespec *tick, struct timespec *now)
 {
@@ -360,7 +141,7 @@ static void dump_syscalls(struct scope_bpf *skel, bool json,
 	int map_fd = bpf_map__fd(skel->maps.sys_hist);
 	int ncpus = libbpf_num_possible_cpus();
 	size_t vsize = bpf_map__value_size(skel->maps.sys_hist);
-	size_t pbuf_sz = percpu_stride(vsize) * ncpus;
+	size_t pbuf_sz = hist_percpu_stride(vsize) * ncpus;
 	char *pbuf = malloc(pbuf_sz);
 	__u64 grand_count = 0, grand_total = 0;
 	double dt;
@@ -372,35 +153,19 @@ static void dump_syscalls(struct scope_bpf *skel, bool json,
 		return;
 	}
 
-	/* Iterate keys (bounded: map holds <= SCOPE_MAX_SYSCALL_NR). */
 	while (keys_done++ < SCOPE_MAX_SYSCALL_NR &&
 	       bpf_map_get_next_key(map_fd, &key, &next) == 0) {
 		struct sys_hist cur;
-		struct sys_hist *p;
 
 		key = next;
 		if (bpf_map_lookup_elem(map_fd, &key, pbuf) != 0)
 			continue;
-		sum_percpu(pbuf, ncpus, vsize, &cur);
+		hist_sum_percpu(pbuf, ncpus, vsize, &cur);
 
-		p = have_prev ? &prev[key] : NULL;
 		if (key < SCOPE_MAX_SYSCALL_NR) {
 			struct sys_row *r = &rows[n++];
-			r->nr = key;
-			r->name = syscall_name(key);
-			r->delta.count = cur.count - (p ? p->count : 0);
-			r->delta.total_ns = cur.total_ns - (p ? p->total_ns : 0);
-			for (int s = 0; s < SCOPE_HIST_SLOTS; s++)
-				r->delta.slots[s] =
-					cur.slots[s] - (p ? p->slots[s] : 0);
-			r->avg_ns = r->delta.count ?
-				r->delta.total_ns / r->delta.count : 0;
-			r->p50_ns = percentile_ns(r->delta.slots,
-						  r->delta.count, 0.50);
-			r->p90_ns = percentile_ns(r->delta.slots,
-						  r->delta.count, 0.90);
-			r->p99_ns = percentile_ns(r->delta.slots,
-						  r->delta.count, 0.99);
+
+			hist_diff_row(key, &cur, &prev[key], have_prev, r);
 			grand_count += r->delta.count;
 			grand_total += r->delta.total_ns;
 		}
@@ -416,56 +181,12 @@ static void dump_syscalls(struct scope_bpf *skel, bool json,
 
 	for (int i = 0; i < n; i++)
 		order[i] = &rows[i];
-	qsort(order, n, sizeof(order[0]), row_cmp);
-	if (n > TOP_N)
-		n = TOP_N;
+	qsort(order, n, sizeof(order[0]), hist_row_cmp);
+	if (n > HIST_TOP_N)
+		n = HIST_TOP_N;
 
-	if (json) {
-		printf("{\"type\":\"syscalls\",\"interval_ns\":%llu,"
-		       "\"count\":%llu,\"top\":[",
-		       (unsigned long long)(dt * 1e9),
-		       (unsigned long long)grand_count);
-		for (int i = 0; i < n; i++) {
-			struct sys_row *r = order[i];
-			if (i)
-				printf(",");
-			printf("{\"nr\":%u,\"name\":\"%s\",\"count\":%llu,"
-			       "\"avg_ns\":%llu,\"p50_ns\":%llu,"
-			       "\"p90_ns\":%llu,\"p99_ns\":%llu}",
-			       r->nr, r->name,
-			       (unsigned long long)r->delta.count,
-			       (unsigned long long)r->avg_ns,
-			       (unsigned long long)r->p50_ns,
-			       (unsigned long long)r->p90_ns,
-			       (unsigned long long)r->p99_ns);
-		}
-		printf("]}\n");
-	} else {
-		char avg[16], p50[16], p90[16], p99[16];
-
-		printf("== syscalls (%.1fs, %llu events, %llu/s, "
-		       "avg %.2fus) ==\n",
-		       dt, (unsigned long long)grand_count,
-		       (unsigned long long)(grand_count / dt),
-		       grand_count ? (double)grand_total / grand_count / 1e3 : 0.0);
-		printf("  %-18s %10s %8s %9s %9s %9s %9s\n",
-		       "SYSCALL", "COUNT", "RATE/s", "AVG", "P50", "P90",
-		       "P99");
-		for (int i = 0; i < n; i++) {
-			struct sys_row *r = order[i];
-			fmt_ns(avg, sizeof(avg), r->avg_ns);
-			fmt_ns(p50, sizeof(p50), r->p50_ns);
-			fmt_ns(p90, sizeof(p90), r->p90_ns);
-			fmt_ns(p99, sizeof(p99), r->p99_ns);
-			printf("  %-18s %10llu %8llu %9s %9s %9s %9s\n",
-			       r->name, (unsigned long long)r->delta.count,
-			       (unsigned long long)(r->delta.count / dt),
-			       avg, p50, p90, p99);
-		}
-	}
+	output_syscalls(order, n, dt, grand_count, grand_total, json);
 }
-
-/* ---- main ---- */
 
 int main(int argc, char **argv)
 {
@@ -507,7 +228,6 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
-	/* Push config into the kernel before attaching. */
 	cfg.sample_rate = opt.sample_rate;
 	cfg.target_pid = opt.pid;
 	cfg.self_pid = (__u32)getpid();
@@ -549,10 +269,9 @@ int main(int argc, char **argv)
 			opt.pid, opt.sample_rate);
 	}
 
-	/* Short poll timeout (20 ms): responsive shutdown, no busy-loop —
-	 * ring_buffer__poll sleeps in epoll until events or timeout. The
-	 * syscall histogram dump runs on a 1 s wall-clock tick, driven by
-	 * the same loop (no extra thread, no timer signal needed). */
+	/* 20 ms poll timeout keeps shutdown responsive without busy looping.
+	 * The histogram dump rides the same loop on a 1 s tick, so no extra
+	 * thread or timer signal is needed. */
 	clock_gettime(CLOCK_MONOTONIC, &tick);
 	while (!stop) {
 		err = ring_buffer__poll(rb, 20);
